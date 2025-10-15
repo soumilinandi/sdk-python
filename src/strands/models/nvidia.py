@@ -216,6 +216,63 @@ class NvidiaChatModel(Model):
         """
         return f"{self.config['base_url']}/chat/completions"
 
+    def format_chunk(self, event: dict[str, Any]) -> StreamEvent:
+        """Format NVIDIA response events into standardized message chunks.
+
+        Args:
+            event: A response event from the NVIDIA model.
+
+        Returns:
+            The formatted chunk in Strands standard format.
+        """
+        match event.get("chunk_type"):
+            case "message_start":
+                return {"messageStart": {"role": "assistant"}}
+            
+            case "content_block_start":
+                return {"contentBlockStart": {"start": {}}}
+            
+            case "content_block_delta":
+                if event.get("data_type") == "text":
+                    return {"contentBlockDelta": {"delta": {"text": event.get("data", "")}}}
+                elif event.get("data_type") == "tool":
+                    return {
+                        "contentBlockDelta": {
+                            "delta": {
+                                "toolUse": {
+                                    "input": event.get("data", {}).get("input", "")
+                                }
+                            }
+                        }
+                    }
+            
+            case "content_block_stop":
+                return {"contentBlockStop": {}}
+            
+            case "message_stop":
+                stop_reason_map = {
+                    "stop": "end_turn",
+                    "length": "max_tokens",
+                    "tool_calls": "tool_use"
+                }
+                return {"messageStop": {"stopReason": stop_reason_map.get(event.get("data"), "end_turn")}}
+            
+            case "metadata":
+                if event.get("data"):
+                    return {
+                        "metadata": {
+                            "usage": {
+                                "inputTokens": event["data"].get("prompt_tokens", 0),
+                                "outputTokens": event["data"].get("completion_tokens", 0),
+                                "totalTokens": event["data"].get("total_tokens", 0),
+                            }
+                        }
+                    }
+                return {"metadata": {"usage": {}}}
+        
+        # Default fallback
+        return {}
+
     def _format_content_block(self, content: ContentBlock) -> dict[str, Any]:
         """Format a content block for NVIDIA API.
 
@@ -312,7 +369,7 @@ class NvidiaChatModel(Model):
         if system_prompt:
             formatted_messages.insert(0, {
                 "role": "system",
-                "content": [{"type": "text", "text": system_prompt}]
+                "content": system_prompt  # Plain string for NVIDIA API
             })
         
         # Prepare base payload
@@ -365,63 +422,6 @@ class NvidiaChatModel(Model):
         
         return payload
 
-    def _process_chunk(self, chunk_data: dict[str, Any]) -> StreamEvent:
-        """Process a streaming chunk from NVIDIA API.
-
-        Args:
-            chunk_data: Raw chunk data from NVIDIA API.
-
-        Returns:
-            Formatted StreamEvent.
-        """
-        try:
-            choice = chunk_data["choices"][0]
-            delta = choice.get("delta", {})
-            finish_reason = choice.get("finish_reason")
-            
-            # Extract tool calls if present
-            tool_calls = delta.get("tool_calls", [])
-            
-            # If there are tool calls, create a tool call event
-            if tool_calls:
-                tool_call = tool_calls[0]
-                return {
-                    "type": "tool_call",
-                    "data": {
-                        "id": tool_call.get("id"),
-                        "name": tool_call.get("function", {}).get("name"),
-                        "input": tool_call.get("function", {}).get("arguments", "{}")
-                    }
-                }
-            
-            # Extract content for regular text responses
-            content = delta.get("content", "")
-            
-            # Create content event
-            event: StreamEvent = {
-                "type": "content_block_delta",
-                "content_block": {
-                    "type": "text",
-                    "text": content
-                }
-            }
-            
-            # Add finish reason if present
-            if finish_reason:
-                event["stop_reason"] = finish_reason
-                
-            return event
-            
-        except (KeyError, IndexError) as e:
-            logger.warning(f"Unexpected chunk format: {chunk_data}, error: {e}")
-            return {
-                "type": "content_block_delta",
-                "content_block": {
-                    "type": "text",
-                    "text": ""
-                }
-            }
-
     async def _stream_async(
         self,
         messages: Messages,
@@ -447,6 +447,15 @@ class NvidiaChatModel(Model):
                 ) as response:
                     response.raise_for_status()
                     
+                    # Emit message start
+                    yield self.format_chunk({"chunk_type": "message_start"})
+                    
+                    # Track state
+                    has_content = False
+                    content_started = False
+                    finish_reason = None
+                    usage_data = None
+                    
                     async for line in response.aiter_lines():
                         if line.startswith("data: "):
                             data = line[6:]  # Remove "data: " prefix
@@ -455,10 +464,65 @@ class NvidiaChatModel(Model):
                             
                             try:
                                 chunk_data = json.loads(data)
-                                yield self._process_chunk(chunk_data)
+                                
+                                # Extract choice data
+                                if "choices" in chunk_data and chunk_data["choices"]:
+                                    choice = chunk_data["choices"][0]
+                                    delta = choice.get("delta", {})
+                                    finish_reason = choice.get("finish_reason") or finish_reason
+                                    
+                                    # Handle text content
+                                    if "content" in delta and delta["content"]:
+                                        if not content_started:
+                                            yield self.format_chunk({"chunk_type": "content_block_start"})
+                                            content_started = True
+                                        
+                                        yield self.format_chunk({
+                                            "chunk_type": "content_block_delta",
+                                            "data_type": "text",
+                                            "data": delta["content"]
+                                        })
+                                        has_content = True
+                                    
+                                    # Handle tool calls
+                                    if "tool_calls" in delta and delta["tool_calls"]:
+                                        for tool_call in delta["tool_calls"]:
+                                            if not content_started:
+                                                yield self.format_chunk({"chunk_type": "content_block_start"})
+                                                content_started = True
+                                            
+                                            tool_input = tool_call.get("function", {}).get("arguments", "")
+                                            yield self.format_chunk({
+                                                "chunk_type": "content_block_delta",
+                                                "data_type": "tool",
+                                                "data": {"input": tool_input}
+                                            })
+                                            has_content = True
+                                
+                                # Extract usage data if available
+                                if "usage" in chunk_data:
+                                    usage_data = chunk_data["usage"]
+                                    
                             except json.JSONDecodeError:
                                 logger.warning(f"Failed to parse chunk: {data}")
                                 continue
+                    
+                    # Emit content block stop if we had content
+                    if content_started:
+                        yield self.format_chunk({"chunk_type": "content_block_stop"})
+                    
+                    # Emit message stop
+                    yield self.format_chunk({
+                        "chunk_type": "message_stop",
+                        "data": finish_reason or "stop"
+                    })
+                    
+                    # Emit metadata if available
+                    if usage_data:
+                        yield self.format_chunk({
+                            "chunk_type": "metadata",
+                            "data": usage_data
+                        })
                                 
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 429:

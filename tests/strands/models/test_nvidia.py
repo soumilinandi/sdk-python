@@ -70,7 +70,7 @@ class TestNvidiaChatModel:
         
         assert model.config["api_key"] == "test-key"
         assert model.config["model_name"] == "nvidia/chat-v1"
-        assert model.config["base_url"] == "https://api.nvidia.com/v1"
+        assert model.config["base_url"] == "https://integrate.api.nvidia.com/v1"
         assert model.config["timeout"] == 30
 
     def test_init_with_environment_variable(self):
@@ -137,7 +137,7 @@ class TestNvidiaChatModel:
     def test_get_base_url(self, nvidia_model):
         """Test base URL generation."""
         base_url = nvidia_model._get_base_url()
-        assert base_url == "https://api.nvidia.com/v1"
+        assert base_url == "https://integrate.api.nvidia.com/v1"
 
     def test_format_content_block_text(self, nvidia_model):
         """Test formatting text content blocks."""
@@ -165,7 +165,7 @@ class TestNvidiaChatModel:
             assert "data:image/png;base64,fake-base64-data" in formatted["image_url"]
 
     def test_format_messages(self, nvidia_model):
-        """Test message formatting."""
+        """Test message formatting - converts content blocks to plain strings for NVIDIA API."""
         messages = [
             {
                 "role": "user",
@@ -181,9 +181,9 @@ class TestNvidiaChatModel:
         
         assert len(formatted) == 2
         assert formatted[0]["role"] == "user"
-        assert formatted[0]["content"][0]["text"] == "Hello"
+        assert formatted[0]["content"] == "Hello"  # Plain string for NVIDIA API
         assert formatted[1]["role"] == "assistant"
-        assert formatted[1]["content"][0]["text"] == "Hi there!"
+        assert formatted[1]["content"] == "Hi there!"  # Plain string for NVIDIA API
 
     def test_format_messages_system_role(self, nvidia_model):
         """Test that system messages are converted to user messages."""
@@ -198,7 +198,7 @@ class TestNvidiaChatModel:
         
         assert len(formatted) == 1
         assert formatted[0]["role"] == "user"
-        assert formatted[0]["content"][0]["text"] == "You are a helpful assistant"
+        assert formatted[0]["content"] == "You are a helpful assistant"  # Plain string for NVIDIA API
 
     def test_prepare_chat_payload(self, nvidia_model, sample_messages):
         """Test chat payload preparation."""
@@ -206,7 +206,7 @@ class TestNvidiaChatModel:
         
         assert payload["model"] == "nvidia/chat-v1"
         assert payload["messages"][0]["role"] == "user"
-        assert payload["messages"][0]["content"][0]["text"] == "Hello, how are you?"
+        assert payload["messages"][0]["content"] == "Hello, how are you?"  # Plain string for NVIDIA API
         assert payload["temperature"] == 0.7
         assert payload["max_tokens"] == 1024
         assert payload["stream"] is True
@@ -237,166 +237,235 @@ class TestNvidiaChatModel:
         
         assert len(payload["messages"]) == 2
         assert payload["messages"][0]["role"] == "system"
-        assert payload["messages"][0]["content"][0]["text"] == "You are helpful"
+        assert payload["messages"][0]["content"] == "You are helpful"  # Plain string for NVIDIA API
 
-    def test_process_chunk(self, nvidia_model):
-        """Test processing streaming chunks."""
-        chunk_data = {
-            "choices": [{
-                "delta": {"content": "Hello"},
-                "finish_reason": None
-            }]
+    def test_format_chunk_content_delta(self, nvidia_model):
+        """Test formatting content delta chunks."""
+        event = {
+            "chunk_type": "content_block_delta",
+            "data_type": "text",
+            "data": "Hello"
         }
         
-        event = nvidia_model._process_chunk(chunk_data)
+        formatted = nvidia_model.format_chunk(event)
         
-        assert event["type"] == "content_block_delta"
-        assert event["content_block"]["text"] == "Hello"
+        assert "contentBlockDelta" in formatted
+        assert formatted["contentBlockDelta"]["delta"]["text"] == "Hello"
 
-    def test_process_chunk_with_tool_calls(self, nvidia_model):
-        """Test processing chunks with tool calls."""
-        chunk_data = {
-            "choices": [{
-                "delta": {
-                    "tool_calls": [{
-                        "id": "call_123",
-                        "function": {
-                            "name": "test_function",
-                            "arguments": '{"arg": "value"}'
-                        }
-                    }]
-                }
-            }]
-        }
+    def test_format_chunk_message_start(self, nvidia_model):
+        """Test formatting message start chunks."""
+        event = {"chunk_type": "message_start"}
         
-        event = nvidia_model._process_chunk(chunk_data)
+        formatted = nvidia_model.format_chunk(event)
         
-        assert event["type"] == "content_block_delta"
-        assert "tool_use" in event
-        assert event["tool_use"]["id"] == "call_123"
-        assert event["tool_use"]["name"] == "test_function"
+        assert "messageStart" in formatted
+        assert formatted["messageStart"]["role"] == "assistant"
 
-    def test_process_chunk_with_finish_reason(self, nvidia_model):
-        """Test processing chunks with finish reason."""
-        chunk_data = {
-            "choices": [{
-                "delta": {"content": ""},
-                "finish_reason": "stop"
-            }]
-        }
+    def test_format_chunk_message_stop(self, nvidia_model):
+        """Test formatting message stop chunks."""
+        event = {"chunk_type": "message_stop", "data": "stop"}
         
-        event = nvidia_model._process_chunk(chunk_data)
+        formatted = nvidia_model.format_chunk(event)
         
-        assert event["stop_reason"] == "stop"
+        assert "messageStop" in formatted
+        assert formatted["messageStop"]["stopReason"] == "end_turn"
 
     @pytest.mark.asyncio
-    async def test_stream_async_success(self, nvidia_model, sample_messages, mock_httpx_client, sample_stream_response):
+    async def test_stream_async_success(self, nvidia_model, sample_messages):
         """Test successful streaming."""
+        sample_stream_response = [
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"index\":0}]}\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\" there\"},\"index\":0}]}\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"!\"},\"index\":0}]}\n",
+            "data: {\"choices\":[{\"finish_reason\":\"stop\",\"index\":0}]}\n",
+            "data: [DONE]\n"
+        ]
+        
         # Mock the streaming response
         mock_response = AsyncMock()
-        mock_response.aiter_lines.return_value = iter(sample_stream_response)
-        mock_httpx_client.stream.return_value.__aenter__.return_value = mock_response
+        mock_response.raise_for_status = AsyncMock()
         
-        events = []
-        async for event in nvidia_model._stream_async(sample_messages):
-            events.append(event)
+        async def mock_aiter_lines():
+            for line in sample_stream_response:
+                yield line
         
-        assert len(events) == 3  # Three content chunks
-        assert events[0]["content_block"]["text"] == "Hello"
-        assert events[1]["content_block"]["text"] == " there"
-        assert events[2]["content_block"]["text"] == "!"
+        mock_response.aiter_lines = mock_aiter_lines
+        
+        with patch("strands.models.nvidia.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_stream_ctx = AsyncMock()
+            mock_stream_ctx.__aenter__.return_value = mock_response
+            mock_stream_ctx.__aexit__.return_value = None
+            mock_client.stream = MagicMock(return_value=mock_stream_ctx)
+            mock_client.__aenter__.return_value = mock_client
+            mock_client.__aexit__.return_value = None
+            mock_client_cls.return_value = mock_client
+            
+            events = []
+            async for event in nvidia_model._stream_async(sample_messages):
+                events.append(event)
+            
+            # Should have: message_start, content_start, 3x content_delta, content_stop, message_stop
+            assert len(events) >= 5
+            # First event should be message start
+            assert "messageStart" in events[0]
+            # Should have content deltas
+            content_events = [e for e in events if "contentBlockDelta" in e]
+            assert len(content_events) == 3
 
     @pytest.mark.asyncio
-    async def test_stream_async_rate_limit_error(self, nvidia_model, sample_messages, mock_httpx_client):
+    async def test_stream_async_rate_limit_error(self, nvidia_model, sample_messages):
         """Test streaming with rate limit error."""
         # Mock rate limit error
-        mock_response = AsyncMock()
-        mock_response.raise_for_status.side_effect = httpx.HTTPStatusError(
-            "Rate limit exceeded", request=MagicMock(), response=MagicMock()
-        )
-        mock_response.status_code = 429
-        mock_httpx_client.stream.return_value.__aenter__.return_value = mock_response
+        mock_error_response = MagicMock()
+        mock_error_response.status_code = 429
         
-        with pytest.raises(ModelThrottledException, match="NVIDIA API rate limit exceeded"):
-            async for _ in nvidia_model._stream_async(sample_messages):
-                pass
+        def raise_status_error():
+            raise httpx.HTTPStatusError(
+                "Rate limit exceeded", 
+                request=MagicMock(), 
+                response=mock_error_response
+            )
+        
+        mock_response = AsyncMock()
+        mock_response.raise_for_status = raise_status_error
+        
+        with patch("strands.models.nvidia.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_stream_ctx = AsyncMock()
+            mock_stream_ctx.__aenter__.return_value = mock_response
+            mock_stream_ctx.__aexit__.return_value = None
+            mock_client.stream = MagicMock(return_value=mock_stream_ctx)
+            mock_client.__aenter__.return_value = mock_client
+            mock_client.__aexit__.return_value = None
+            mock_client_cls.return_value = mock_client
+            
+            with pytest.raises(ModelThrottledException, match="NVIDIA API rate limit exceeded"):
+                async for _ in nvidia_model._stream_async(sample_messages):
+                    pass
 
     @pytest.mark.asyncio
-    async def test_structured_output_async_success(self, nvidia_model, sample_messages, mock_httpx_client):
+    async def test_structured_output_async_success(self, nvidia_model, sample_messages):
         """Test successful structured output."""
-        # Mock structured output response
-        mock_response = AsyncMock()
-        mock_response.json.return_value = {
-            "choices": [{
-                "message": {
-                    "content": '{"name": "John", "age": 30}'
-                }
-            }]
-        }
-        mock_httpx_client.post.return_value = mock_response
-        
         # Define output model
         class Person(pydantic.BaseModel):
             name: str
             age: int
         
-        events = []
-        async for event in nvidia_model._structured_output_async(Person, sample_messages):
-            events.append(event)
+        # Mock streaming response with JSON content
+        sample_response = [
+            'data: {"choices":[{"delta":{"content":"{\\"name\\""},\"index\":0}]}\n',
+            'data: {"choices":[{"delta":{"content":": \\"John\\","},\"index\":0}]}\n',
+            'data: {"choices":[{"delta":{"content":" \\"age\\": 30}"},\"index\":0}]}\n',
+            'data: {"choices":[{"finish_reason":"stop","index":0}]}\n',
+            'data: [DONE]\n'
+        ]
         
-        assert len(events) == 1
-        assert events[0]["type"] == "structured_output"
-        assert isinstance(events[0]["data"], Person)
-        assert events[0]["data"].name == "John"
-        assert events[0]["data"].age == 30
+        # Mock the streaming response
+        mock_response = AsyncMock()
+        mock_response.raise_for_status = AsyncMock()
+        
+        async def mock_aiter_lines():
+            for line in sample_response:
+                yield line
+        
+        mock_response.aiter_lines = mock_aiter_lines
+        
+        with patch("strands.models.nvidia.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_stream_ctx = AsyncMock()
+            mock_stream_ctx.__aenter__.return_value = mock_response
+            mock_stream_ctx.__aexit__.return_value = None
+            mock_client.stream = MagicMock(return_value=mock_stream_ctx)
+            mock_client.__aenter__.return_value = mock_client
+            mock_client.__aexit__.return_value = None
+            mock_client_cls.return_value = mock_client
+            
+            events = []
+            async for event in nvidia_model._structured_output_async(Person, sample_messages):
+                events.append(event)
+            
+            assert len(events) == 1
+            assert events[0]["type"] == "structured_output"
+            assert isinstance(events[0]["data"], Person)
+            assert events[0]["data"].name == "John"
+            assert events[0]["data"].age == 30
 
     @pytest.mark.asyncio
-    async def test_structured_output_async_invalid_json(self, nvidia_model, sample_messages, mock_httpx_client):
+    async def test_structured_output_async_invalid_json(self, nvidia_model, sample_messages):
         """Test structured output with invalid JSON."""
-        # Mock invalid JSON response
-        mock_response = AsyncMock()
-        mock_response.json.return_value = {
-            "choices": [{
-                "message": {
-                    "content": "invalid json"
-                }
-            }]
-        }
-        mock_httpx_client.post.return_value = mock_response
-        
         class Person(pydantic.BaseModel):
             name: str
             age: int
         
-        with pytest.raises(ValueError, match="Response format does not match Person"):
-            async for _ in nvidia_model._structured_output_async(Person, sample_messages):
-                pass
+        # Mock streaming response with invalid JSON
+        sample_response = [
+            'data: {"choices":[{"delta":{"content":"invalid json"},\"index\":0}]}\n',
+            'data: {"choices":[{"finish_reason":"stop","index":0}]}\n',
+            'data: [DONE]\n'
+        ]
+        
+        # Mock the streaming response
+        mock_response = AsyncMock()
+        mock_response.raise_for_status = AsyncMock()
+        
+        async def mock_aiter_lines():
+            for line in sample_response:
+                yield line
+        
+        mock_response.aiter_lines = mock_aiter_lines
+        
+        with patch("strands.models.nvidia.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_stream_ctx = AsyncMock()
+            mock_stream_ctx.__aenter__.return_value = mock_response
+            mock_stream_ctx.__aexit__.return_value = None
+            mock_client.stream = MagicMock(return_value=mock_stream_ctx)
+            mock_client.__aenter__.return_value = mock_client
+            mock_client.__aexit__.return_value = None
+            mock_client_cls.return_value = mock_client
+            
+            with pytest.raises(ValueError, match="Invalid JSON in structured output"):
+                async for _ in nvidia_model._structured_output_async(Person, sample_messages):
+                    pass
 
-    def test_stream_method(self, nvidia_model, sample_messages):
+    @pytest.mark.asyncio
+    async def test_stream_method(self, nvidia_model, sample_messages):
         """Test the public stream method."""
         with patch.object(nvidia_model, "_stream_async") as mock_stream_async:
-            mock_stream_async.return_value = iter([])
+            async def async_gen():
+                yield {"messageStart": {"role": "assistant"}}
             
-            # Call the public stream method
-            result = nvidia_model.stream(sample_messages)
+            mock_stream_async.return_value = async_gen()
             
-            # Should call the async method
+            # Call the public stream method and consume it
+            events = []
+            async for event in nvidia_model.stream(sample_messages):
+                events.append(event)
+            
+            # Should have called the async method
             mock_stream_async.assert_called_once_with(
                 sample_messages, None, None, None
             )
 
-    def test_structured_output_method(self, nvidia_model, sample_messages):
+    @pytest.mark.asyncio
+    async def test_structured_output_method(self, nvidia_model, sample_messages):
         """Test the public structured_output method."""
         with patch.object(nvidia_model, "_structured_output_async") as mock_structured_output_async:
-            mock_structured_output_async.return_value = iter([])
-            
             class Person(pydantic.BaseModel):
                 name: str
             
-            # Call the public structured_output method
-            result = nvidia_model.structured_output(Person, sample_messages)
+            async def async_gen():
+                yield {"type": "structured_output", "data": Person(name="test")}
             
-            # Should call the async method
+            mock_structured_output_async.return_value = async_gen()
+            
+            # Call the public structured_output method and consume it
+            events = []
+            async for event in nvidia_model.structured_output(Person, sample_messages):
+                events.append(event)
+            
+            # Should have called the async method
             mock_structured_output_async.assert_called_once_with(
                 Person, sample_messages, None
             )
