@@ -1,9 +1,7 @@
-"""NVIDIA model provider.
-
-- Docs: https://docs.nvidia.com/ai-foundation/
-"""
+"""NVIDIA model provider"""
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -29,11 +27,12 @@ class NvidiaConfig(TypedDict, total=False):
     """Configuration options for NVIDIA models.
 
     Attributes:
-        api_key: NVIDIA API key for authentication.
+        api_key: NVIDIA API key for authentication (required for hosted endpoints only).
             Can also be set via NVIDIA_API_KEY environment variable.
+            Not required for local NIM deployments.
         base_url: Base URL for NVIDIA API endpoints.
-            Defaults to "https://api.nvidia.com/v1".
-        model_name: NVIDIA model name (e.g., "nvidia/chat-v1").
+            Defaults to "https://integrate.api.nvidia.com/v1".
+        model_name: NVIDIA model name (e.g., "meta/llama-3.1-8b-instruct").
         temperature: Sampling temperature in [0, 1].
         max_tokens: Maximum number of tokens to generate.
         top_p: Top-p for distribution sampling.
@@ -63,13 +62,23 @@ class NvidiaChatModel(Model):
         .. code-block:: python
 
             from strands.models.nvidia import NvidiaChatModel
+            from strands import Agent
 
+            # For hosted endpoints (requires API key)
             model = NvidiaChatModel(
                 api_key="your-api-key",
-                model_name="nvidia/chat-v1"
+                model_name="meta/llama-3.1-8b-instruct"
             )
             agent = Agent(model=model)
             response = agent("Hello!")
+            
+            # For local NIM deployments (no API key needed)
+            local_model = NvidiaChatModel(
+                base_url="http://localhost:8000/v1",
+                model_name="meta/llama-3.1-8b-instruct"
+            )
+            local_agent = Agent(model=local_model)
+            response = local_agent("Hello!")
     """
 
     def __init__(self, **model_config: Unpack[NvidiaConfig]) -> None:
@@ -77,9 +86,12 @@ class NvidiaChatModel(Model):
 
         Args:
             **model_config: Configuration options for the NVIDIA chat model.
-                api_key: NVIDIA API key. Can also be set via NVIDIA_API_KEY environment variable.
-                base_url: Base URL for NVIDIA API endpoints. Defaults to "https://api.nvidia.com/v1".
-                model_name: NVIDIA model name (e.g., "nvidia/chat-v1").
+                api_key: NVIDIA API key (required for hosted endpoints only).
+                    Can also be set via NVIDIA_API_KEY environment variable.
+                    Not required for local NIM deployments.
+                base_url: Base URL for NVIDIA API endpoints. 
+                    Defaults to "https://integrate.api.nvidia.com/v1".
+                model_name: NVIDIA model name (e.g., "meta/llama-3.1-8b-instruct").
                 temperature: Sampling temperature in [0, 1].
                 max_tokens: Maximum number of tokens to generate.
                 top_p: Top-p for distribution sampling.
@@ -88,8 +100,9 @@ class NvidiaChatModel(Model):
                 timeout: Request timeout in seconds.
 
         API Key:
-            The recommended way to provide the API key is through the `NVIDIA_API_KEY`
-            environment variable. Alternatively, you can pass it directly as a parameter.
+            For hosted NVIDIA endpoints (nvidia.com), an API key is required and can be
+            provided via the `NVIDIA_API_KEY` environment variable or passed directly.
+            For local NIM deployments, no API key is needed.
         """
         validate_config_keys(model_config, NvidiaConfig)
         self.config = dict(model_config)
@@ -100,18 +113,24 @@ class NvidiaChatModel(Model):
         
         # Handle API key from environment variable or config
         api_key = self.config.get("api_key") or os.environ.get("NVIDIA_API_KEY")
-        if not api_key:
+        
+        # API key is only required for hosted endpoints (nvidia.com domains)
+        # Local NIM deployments don't require an API key
+        base_url = self.config.get("base_url", "")
+        is_hosted = "nvidia.com" in base_url
+        
+        if is_hosted and not api_key:
             raise ValueError(
-                "NVIDIA API key is required. Set NVIDIA_API_KEY environment variable "
-                "or pass api_key parameter."
+                "NVIDIA API key is required for hosted endpoints. "
+                "Set NVIDIA_API_KEY environment variable or pass api_key parameter."
             )
-        self.config["api_key"] = api_key
+        
+        if api_key:
+            self.config["api_key"] = api_key
         
         # Validate required fields
         if not self.config.get("model_name"):
             raise ValueError("model_name is required for NvidiaChatModel")
-        
-        logger.debug("config=<%s> | initializing", self.config)
 
     @override
     def update_config(self, **model_config: Unpack[NvidiaConfig]) -> None:
@@ -190,7 +209,7 @@ class NvidiaChatModel(Model):
             Dictionary of HTTP headers.
         """
         headers = {
-            "Accept": "application/json",
+            "Accept": "text/event-stream",
             "Content-Type": "application/json",
             "User-Agent": "strands-agents",
         }
@@ -200,21 +219,14 @@ class NvidiaChatModel(Model):
             
         return headers
 
-    def _get_base_url(self) -> str:
-        """Get the base URL for NVIDIA API requests.
-
-        Returns:
-            The base URL for API requests.
-        """
-        return self.config["base_url"].rstrip("/")
-    
     def _get_infer_url(self) -> str:
         """Get the inference URL for NVIDIA API requests.
 
         Returns:
             The inference URL for API requests.
         """
-        return f"{self.config['base_url']}/chat/completions"
+        base_url = self.config["base_url"].rstrip("/")
+        return f"{base_url}/chat/completions"
 
     def format_chunk(self, event: dict[str, Any]) -> StreamEvent:
         """Format NVIDIA response events into standardized message chunks.
@@ -287,12 +299,14 @@ class NvidiaChatModel(Model):
         elif "image" in content:
             # Handle image content - convert to base64 data URL
             image_data = content["image"]["source"]["bytes"]
-            mime_type = content["image"]["source"]["mediaType"]
-            import base64
+            mime_type = content["image"].get("format", "image/jpeg")
+            # Convert format to MIME type if needed
+            if not mime_type.startswith("image/"):
+                mime_type = f"image/{mime_type}"
             encoded = base64.b64encode(image_data).decode("utf-8")
             return {
                 "type": "image_url",
-                "image_url": f"data:{mime_type};base64,{encoded}"
+                "image_url": {"url": f"data:{mime_type};base64,{encoded}"}
             }
         else:
             raise ValueError(f"Unsupported content block type: {content}")
@@ -309,36 +323,54 @@ class NvidiaChatModel(Model):
         formatted_messages = []
         
         for message in messages:
-            if message["role"] == "system":
-                # NVIDIA doesn't have system messages, convert to user message
-                # Extract text content from content blocks
-                text_content = ""
+            if message["role"] in ["system", "user", "assistant"]:
+                # Format content blocks (supports text and images)
+                content_parts = []
                 for content_block in message["content"]:
-                    if content_block.get("text"):
-                        text_content += content_block["text"]
+                    if "text" in content_block or "image" in content_block:
+                        try:
+                            content_parts.append(self._format_content_block(content_block))
+                        except ValueError:
+                            # Skip unsupported content types
+                            continue
                 
-                formatted_messages.append({
-                    "role": "user",
-                    "content": text_content
-                })
-            elif message["role"] in ["user", "assistant"]:
-                # Extract text content from content blocks
-                text_content = ""
-                for content_block in message["content"]:
-                    if content_block.get("text"):
-                        text_content += content_block["text"]
-                
-                formatted_messages.append({
-                    "role": message["role"],
-                    "content": text_content
-                })
+                # Use string for text-only, array for multimodal
+                if len(content_parts) == 1 and content_parts[0].get("type") == "text":
+                    formatted_messages.append({
+                        "role": message["role"],
+                        "content": content_parts[0]["text"]
+                    })
+                elif content_parts:
+                    formatted_messages.append({
+                        "role": message["role"],
+                        "content": content_parts
+                    })
             elif message["role"] == "tool":
-                # Convert tool result to assistant message
-                tool_result = message["content"][0]["toolResult"]
-                formatted_messages.append({
-                    "role": "assistant",
-                    "content": f"Tool result: {tool_result}"
-                })
+                # Format tool result message (OpenAI-compatible format)
+                # Tool results in Strands format have toolResult in content blocks
+                for content_block in message["content"]:
+                    if "toolResult" in content_block:
+                        tool_result = content_block["toolResult"]
+                        # Extract text content from tool result
+                        content_parts = []
+                        for result_content in tool_result.get("content", []):
+                            if "text" in result_content:
+                                content_parts.append({"type": "text", "text": result_content["text"]})
+                            elif "json" in result_content:
+                                # Convert JSON to text representation
+                                content_parts.append({"type": "text", "text": json.dumps(result_content["json"])})
+                        
+                        # Use plain string if single text content, array otherwise
+                        if len(content_parts) == 1 and content_parts[0].get("type") == "text":
+                            content = content_parts[0]["text"]
+                        else:
+                            content = content_parts
+                        
+                        formatted_messages.append({
+                            "role": "tool",
+                            "tool_call_id": tool_result["toolUseId"],
+                            "content": content
+                        })
         
         return formatted_messages
 
@@ -376,7 +408,7 @@ class NvidiaChatModel(Model):
         payload = {
             "model": self.config["model_name"],
             "messages": formatted_messages,
-            "stream": kwargs.get("stream", True),
+            "stream": True,
         }
         
         # Add optional parameters
@@ -450,11 +482,14 @@ class NvidiaChatModel(Model):
                     # Emit message start
                     yield self.format_chunk({"chunk_type": "message_start"})
                     
+                    # Always start with text content block (even if empty)
+                    yield self.format_chunk({"chunk_type": "content_block_start"})
+                    
                     # Track state
-                    has_content = False
-                    content_started = False
+                    has_text_content = False
                     finish_reason = None
                     usage_data = None
+                    tool_calls: dict[int, list[dict[str, Any]]] = {}  # Collect tool calls by index
                     
                     async for line in response.aiter_lines():
                         if line.startswith("data: "):
@@ -473,42 +508,66 @@ class NvidiaChatModel(Model):
                                     
                                     # Handle text content
                                     if "content" in delta and delta["content"]:
-                                        if not content_started:
-                                            yield self.format_chunk({"chunk_type": "content_block_start"})
-                                            content_started = True
-                                        
                                         yield self.format_chunk({
                                             "chunk_type": "content_block_delta",
                                             "data_type": "text",
                                             "data": delta["content"]
                                         })
-                                        has_content = True
+                                        has_text_content = True
                                     
-                                    # Handle tool calls
+                                    # Collect tool calls (don't emit yet)
                                     if "tool_calls" in delta and delta["tool_calls"]:
                                         for tool_call in delta["tool_calls"]:
-                                            if not content_started:
-                                                yield self.format_chunk({"chunk_type": "content_block_start"})
-                                                content_started = True
-                                            
-                                            tool_input = tool_call.get("function", {}).get("arguments", "")
-                                            yield self.format_chunk({
-                                                "chunk_type": "content_block_delta",
-                                                "data_type": "tool",
-                                                "data": {"input": tool_input}
-                                            })
-                                            has_content = True
+                                            index = tool_call.get("index", 0)
+                                            tool_calls.setdefault(index, []).append(tool_call)
                                 
                                 # Extract usage data if available
                                 if "usage" in chunk_data:
                                     usage_data = chunk_data["usage"]
                                     
                             except json.JSONDecodeError:
-                                logger.warning(f"Failed to parse chunk: {data}")
+                                logger.warning("data=<%s> | failed to parse chunk", data)
                                 continue
                     
-                    # Emit content block stop if we had content
-                    if content_started:
+                    # Close text content block
+                    yield self.format_chunk({"chunk_type": "content_block_stop"})
+                    
+                    # Emit tool calls as separate content blocks
+                    for tool_deltas in tool_calls.values():
+                        if not tool_deltas:
+                            continue
+                        
+                        # First delta contains tool metadata (id, name)
+                        first_delta = tool_deltas[0]
+                        tool_id = first_delta.get("id")
+                        tool_name = first_delta.get("function", {}).get("name")
+                        
+                        # Emit content block start with tool metadata
+                        if tool_id and tool_name:
+                            yield {
+                                "contentBlockStart": {
+                                    "start": {
+                                        "toolUse": {
+                                            "toolUseId": tool_id,
+                                            "name": tool_name
+                                        }
+                                    }
+                                }
+                            }
+                        else:
+                            yield self.format_chunk({"chunk_type": "content_block_start"})
+                        
+                        # Emit all deltas for this tool (streaming arguments)
+                        for tool_delta in tool_deltas:
+                            tool_input = tool_delta.get("function", {}).get("arguments", "")
+                            if tool_input:  # Only emit if there's content
+                                yield self.format_chunk({
+                                    "chunk_type": "content_block_delta",
+                                    "data_type": "tool",
+                                    "data": {"input": tool_input}
+                                })
+                        
+                        # Emit content block stop for this tool
                         yield self.format_chunk({"chunk_type": "content_block_stop"})
                     
                     # Emit message stop
@@ -528,10 +587,10 @@ class NvidiaChatModel(Model):
             if e.response.status_code == 429:
                 raise ModelThrottledException("NVIDIA API rate limit exceeded")
             else:
-                logger.error(f"NVIDIA API error: {e}")
+                logger.error("error=<%s> | nvidia api error", e)
                 raise
         except Exception as e:
-            logger.error(f"Unexpected error in NVIDIA chat stream: {e}")
+            logger.error("error=<%s> | unexpected error in nvidia chat stream", e)
             raise
 
     async def _structured_output_async(
@@ -547,9 +606,6 @@ class NvidiaChatModel(Model):
                 payload["nvext"] = {
                     "guided_json": output_model.model_json_schema()
                 }
-            
-            # Debug: Log the payload
-            logger.debug(f"NVIDIA structured output payload: {json.dumps(payload, indent=2)}")
             
             # Make request to NVIDIA API
             async with httpx.AsyncClient(timeout=self.config["timeout"]) as client:
@@ -577,7 +633,7 @@ class NvidiaChatModel(Model):
                                     if "content" in delta:
                                         content_buffer += delta["content"]
                             except json.JSONDecodeError:
-                                logger.warning(f"Failed to parse chunk: {data}")
+                                logger.warning("data=<%s> | failed to parse chunk", data)
                                 continue
                     
                     # Parse the complete JSON content
@@ -587,12 +643,7 @@ class NvidiaChatModel(Model):
                     try:
                         parsed_data = json.loads(content_buffer)
                         structured_output = output_model(**parsed_data)
-                        
-                        yield {
-                            "type": "structured_output",
-                            "data": structured_output,
-                            "raw_content": content_buffer
-                        }
+                        yield {"output": structured_output}
                     except json.JSONDecodeError as e:
                         raise ValueError(f"Invalid JSON in structured output: {content_buffer}") from e
                     except Exception as e:
@@ -602,8 +653,8 @@ class NvidiaChatModel(Model):
             if e.response.status_code == 429:
                 raise ModelThrottledException("NVIDIA API rate limit exceeded")
             else:
-                logger.error(f"NVIDIA API error: {e}")
+                logger.error("error=<%s> | nvidia api error in structured output", e)
                 raise
         except Exception as e:
-            logger.error(f"Unexpected error in NVIDIA structured output: {e}")
+            logger.error("error=<%s> | unexpected error in nvidia structured output", e)
             raise
