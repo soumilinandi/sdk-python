@@ -326,6 +326,8 @@ class NvidiaChatModel(Model):
             if message["role"] in ["system", "user", "assistant"]:
                 # Format content blocks (supports text and images)
                 content_parts = []
+                tool_calls = []
+                
                 for content_block in message["content"]:
                     if "text" in content_block or "image" in content_block:
                         try:
@@ -333,18 +335,38 @@ class NvidiaChatModel(Model):
                         except ValueError:
                             # Skip unsupported content types
                             continue
+                    elif "toolUse" in content_block:
+                        # Extract tool calls from assistant messages
+                        tool_use = content_block["toolUse"]
+                        tool_calls.append({
+                            "id": tool_use["toolUseId"],
+                            "type": "function",
+                            "function": {
+                                "name": tool_use["name"],
+                                "arguments": json.dumps(tool_use["input"])
+                            }
+                        })
                 
-                # Use string for text-only, array for multimodal
+                # Build the formatted message
+                formatted_msg = {"role": message["role"]}
+                
+                # Use string for text-only, array for multimodal, or None for tool-only
                 if len(content_parts) == 1 and content_parts[0].get("type") == "text":
-                    formatted_messages.append({
-                        "role": message["role"],
-                        "content": content_parts[0]["text"]
-                    })
+                    formatted_msg["content"] = content_parts[0]["text"]
                 elif content_parts:
-                    formatted_messages.append({
-                        "role": message["role"],
-                        "content": content_parts
-                    })
+                    formatted_msg["content"] = content_parts
+                elif tool_calls:
+                    # Tool-only message (no text content)
+                    formatted_msg["content"] = None
+                else:
+                    # Skip messages with no content
+                    continue
+                
+                # Add tool calls if present
+                if tool_calls:
+                    formatted_msg["tool_calls"] = tool_calls
+                
+                formatted_messages.append(formatted_msg)
             elif message["role"] == "tool":
                 # Format tool result message (OpenAI-compatible format)
                 # Tool results in Strands format have toolResult in content blocks
@@ -360,11 +382,12 @@ class NvidiaChatModel(Model):
                                 # Convert JSON to text representation
                                 content_parts.append({"type": "text", "text": json.dumps(result_content["json"])})
                         
-                        # Use plain string if single text content, array otherwise
-                        if len(content_parts) == 1 and content_parts[0].get("type") == "text":
-                            content = content_parts[0]["text"]
+                        # NVIDIA API requires plain string for tool results (OpenAI-compatible format)
+                        if content_parts:
+                            # Join all text parts into a single string
+                            content = " ".join(part["text"] for part in content_parts if part.get("type") == "text")
                         else:
-                            content = content_parts
+                            content = ""
                         
                         formatted_messages.append({
                             "role": "tool",
@@ -396,6 +419,7 @@ class NvidiaChatModel(Model):
         """
         # Format messages
         formatted_messages = self._format_messages(messages)
+        logger.debug("formatted_messages=%s", json.dumps(formatted_messages, indent=2))
         
         # Add system prompt if provided
         if system_prompt:
